@@ -33,6 +33,8 @@ axios.defaults.adapter = httpAdapter;
 beforeAll(async () => {
   const http = axios.create({ baseURL: apiBaseUrl });
 
+  await purgePerksWithInvalidCreator();
+
 
   const credentials = {
     name: `UI Test User ${crypto.randomUUID()}`,
@@ -48,15 +50,31 @@ beforeAll(async () => {
 
   window.localStorage.setItem('token', registrationPayload.token);
 
-  const seedPerkResponse = await api.post('/perks', {
+  const seedPerkPayload = {
     title: 'Integration Preview Benefit',
     description: 'Baseline record created during setup for deterministic rendering checks.',
     category: 'travel',
     merchant: 'Integration Merchant',
     discountPercent: 15
-  });
+  };
 
-  const seededPerk = seedPerkResponse.data.perk;
+  let seededPerk;
+  try {
+    const seedPerkResponse = await api.post('/perks', seedPerkPayload);
+    seededPerk = seedPerkResponse.data.perk;
+  } catch (err) {
+    if (err.response?.status === 409) {
+      await removeConflictingPerks(seedPerkPayload.title, seedPerkPayload.merchant);
+      const retryResponse = await api.post('/perks', seedPerkPayload);
+      seededPerk = retryResponse.data.perk;
+    } else {
+      throw err;
+    }
+  }
+
+  if (!seededPerk?._id) {
+    throw new Error('Failed to seed baseline perk for integration tests.');
+  }
   if (seededPerk?._id) {
     createdPerkIds.add(seededPerk._id);
   }
@@ -91,6 +109,102 @@ afterAll(async () => {
 
   window.localStorage.clear();
 });
+
+async function removeConflictingPerks(title, merchant) {
+  if (!title) return;
+
+  const titleLiteral = JSON.stringify(title);
+  const merchantLiteral = merchant ? JSON.stringify(merchant) : null;
+  const script = `
+    import mongoose from 'mongoose';
+    const uri = process.env.MONGO_URI;
+    if (!uri) {
+      throw new Error('Missing MONGO_URI for cleanup script');
+    }
+    await mongoose.connect(uri, { autoIndex: true });
+    const query = { title: ${titleLiteral} };
+    ${merchant ? 'query.merchant = ' + merchantLiteral + ';' : ''}
+    await mongoose.connection.collection('perks').deleteMany(query);
+    await mongoose.disconnect();
+  `;
+
+  await new Promise((resolve, reject) => {
+    const cleanup = spawn(process.execPath, ['--input-type=module', '-'], {
+      env: { ...process.env },
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+
+    cleanup.stdin.write(script);
+    cleanup.stdin.end();
+
+    cleanup.stdout.on('data', (chunk) => {
+      const text = chunk.toString().trim();
+      if (text) console.log(`[cleanup stdout] ${text}`);
+    });
+    cleanup.stderr.on('data', (chunk) => {
+      const text = chunk.toString().trim();
+      if (text) console.error(`[cleanup stderr] ${text}`);
+    });
+
+    cleanup.on('exit', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error('Failed to remove conflicting perks before seeding.'));
+    });
+  });
+}
+
+async function purgePerksWithInvalidCreator() {
+  const script = `
+    import mongoose from 'mongoose';
+    const uri = process.env.MONGO_URI;
+    if (!uri) {
+      throw new Error('Missing MONGO_URI for cleanup script');
+    }
+    await mongoose.connect(uri, { autoIndex: true });
+    const perksCollection = mongoose.connection.collection('perks');
+    const cursor = perksCollection.find({}, { projection: { _id: 1, createdBy: 1 } });
+    const invalidIds = [];
+    for await (const doc of cursor) {
+      const createdBy = doc.createdBy;
+      if (!createdBy) continue;
+      const isValid =
+        typeof createdBy === 'object' && createdBy !== null && createdBy._bsontype === 'ObjectId'
+          ? true
+          : mongoose.Types.ObjectId.isValid(createdBy?.toString());
+      if (!isValid) {
+        invalidIds.push(doc._id);
+      }
+    }
+    if (invalidIds.length) {
+      await perksCollection.deleteMany({ _id: { $in: invalidIds } });
+    }
+    await mongoose.disconnect();
+  `;
+
+  await new Promise((resolve, reject) => {
+    const cleanup = spawn(process.execPath, ['--input-type=module', '-'], {
+      env: { ...process.env },
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+
+    cleanup.stdin.write(script);
+    cleanup.stdin.end();
+
+    cleanup.stdout.on('data', (chunk) => {
+      const text = chunk.toString().trim();
+      if (text) console.log(`[cleanup stdout] ${text}`);
+    });
+    cleanup.stderr.on('data', (chunk) => {
+      const text = chunk.toString().trim();
+      if (text) console.error(`[cleanup stderr] ${text}`);
+    });
+
+    cleanup.on('exit', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error('Failed to purge perks with invalid creator references.'));
+    });
+  });
+}
 
 async function removeTestUser(email) {
   if (!email) return;
